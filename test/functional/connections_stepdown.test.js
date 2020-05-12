@@ -9,11 +9,23 @@ function ignoreNsNotFound(err) {
   }
 }
 
-function connectionCount(db) {
+function connectionCountOnPrimary(db) {
   return db
     .admin()
-    .serverStatus()
+    .serverStatus({ readPreference: 'primary' })
     .then(result => result.connections.totalCreated);
+}
+
+function connectionCount(cursor) {
+  const server = cursor.server;
+  return new Promise((resolve, reject) => {
+    server.command('admin.$cmd', { serverStatus: 1 }, (err, res) => {
+      if (err) return reject(err);
+
+      const result = res.result;
+      resolve(result.connections.totalCreated);
+    });
+  });
 }
 
 function expectPoolWasCleared(initialCount) {
@@ -30,10 +42,12 @@ describe('Connections survive primary step down', function() {
   let collection;
 
   beforeEach(function() {
-    client = this.configuration.newClient(
-      { w: 1 },
-      { poolSize: 1, retryWrites: false, useUnifiedTopology: true }
-    );
+    client = this.configuration.newClient({
+      poolSize: 1,
+      retryWrites: false,
+      useUnifiedTopology: true,
+      heartbeatFrequencyMS: 100
+    });
 
     return client
       .connect()
@@ -58,42 +72,41 @@ describe('Connections survive primary step down', function() {
     metadata: { requires: { mongodb: '>=4.2.0', topology: 'replicaset' } },
 
     test: function() {
-      return connectionCount(db).then(initialConnectionCount => {
-        return collection
-          .insertMany([{ a: 1 }, { a: 2 }, { a: 3 }, { a: 4 }, { a: 5 }], {
-            w: 'majority'
-          })
-          .then(result => expect(result.insertedCount).to.equal(5))
-          .then(() => {
-            const cursor = collection.find({}, { batchSize: 2 });
-            deferred.push(() => cursor.close());
+      return collection
+        .insertMany([{ a: 1 }, { a: 2 }, { a: 3 }, { a: 4 }, { a: 5 }], {
+          w: 'majority'
+        })
+        .then(result => expect(result.insertedCount).to.equal(5))
+        .then(() => {
+          const cursor = collection.find({}, { batchSize: 2 });
+          deferred.push(() => cursor.close());
 
-            return cursor
-              .next()
-              .then(item => expect(item.a).to.equal(1))
-              .then(() => cursor.next())
-              .then(item => expect(item.a).to.equal(2))
-              .then(() =>
-                db
-                  .executeDbAdminCommand(
-                    { replSetStepDown: 5, force: true },
-                    { readPreference: 'primary' }
-                  )
-                  .then(() => cursor.next())
-                  .then(item => expect(item.a).to.equal(3))
-                  .then(() =>
-                    connectionCount(db).then(expectPoolWasNotCleared(initialConnectionCount))
-                  )
-              );
-          });
-      });
+          return cursor
+            .next()
+            .then(item => expect(item.a).to.equal(1))
+            .then(() => cursor.next())
+            .then(item => expect(item.a).to.equal(2))
+            .then(() => connectionCount(cursor))
+            .then(initialConnectionCount => {
+              return db
+                .executeDbAdminCommand(
+                  { replSetStepDown: 5, force: true },
+                  { readPreference: 'primary' }
+                )
+                .then(() => cursor.next())
+                .then(item => expect(item.a).to.equal(3))
+                .then(() =>
+                  connectionCount(cursor).then(expectPoolWasNotCleared(initialConnectionCount))
+                );
+            });
+        });
     }
   });
 
   it('Not Master - Keep Connection Pool', {
     metadata: { requires: { mongodb: '>=4.2.0', topology: 'replicaset' } },
     test: function() {
-      return connectionCount(db).then(initialConnectionCount => {
+      return connectionCountOnPrimary(db).then(initialConnectionCount => {
         return db
           .executeDbAdminCommand({
             configureFailPoint: 'failCommand',
@@ -112,7 +125,9 @@ describe('Connections survive primary step down', function() {
               expect(result.insertedCount).to.equal(1);
             })
           )
-          .then(() => connectionCount(db).then(expectPoolWasNotCleared(initialConnectionCount)));
+          .then(() =>
+            connectionCountOnPrimary(db).then(expectPoolWasNotCleared(initialConnectionCount))
+          );
       });
     }
   });
@@ -120,7 +135,7 @@ describe('Connections survive primary step down', function() {
   it('Not Master - Reset Connection Pool', {
     metadata: { requires: { mongodb: '4.0.x', topology: 'replicaset' } },
     test: function() {
-      return connectionCount(db).then(initialConnectionCount => {
+      return connectionCountOnPrimary(db).then(initialConnectionCount => {
         return db
           .executeDbAdminCommand({
             configureFailPoint: 'failCommand',
@@ -134,7 +149,9 @@ describe('Connections survive primary step down', function() {
 
             return collection.insertOne({ test: 1 }).catch(err => expect(err.code).to.equal(10107));
           })
-          .then(() => connectionCount(db).then(expectPoolWasCleared(initialConnectionCount)));
+          .then(() =>
+            connectionCountOnPrimary(db).then(expectPoolWasCleared(initialConnectionCount))
+          );
       });
     }
   });
@@ -142,7 +159,7 @@ describe('Connections survive primary step down', function() {
   it('Shutdown in progress - Reset Connection Pool', {
     metadata: { requires: { mongodb: '>=4.0.0', topology: 'replicaset' } },
     test: function() {
-      return connectionCount(db).then(initialConnectionCount => {
+      return connectionCountOnPrimary(db).then(initialConnectionCount => {
         return db
           .executeDbAdminCommand({
             configureFailPoint: 'failCommand',
@@ -156,7 +173,9 @@ describe('Connections survive primary step down', function() {
 
             return collection.insertOne({ test: 1 }).catch(err => expect(err.code).to.equal(91));
           })
-          .then(() => connectionCount(db).then(expectPoolWasCleared(initialConnectionCount)));
+          .then(() =>
+            connectionCountOnPrimary(db).then(expectPoolWasCleared(initialConnectionCount))
+          );
       });
     }
   });
@@ -164,7 +183,7 @@ describe('Connections survive primary step down', function() {
   it('Interrupted at shutdown - Reset Connection Pool', {
     metadata: { requires: { mongodb: '>=4.0.0', topology: 'replicaset' } },
     test: function() {
-      return connectionCount(db).then(initialConnectionCount => {
+      return connectionCountOnPrimary(db).then(initialConnectionCount => {
         return db
           .executeDbAdminCommand({
             configureFailPoint: 'failCommand',
@@ -178,7 +197,9 @@ describe('Connections survive primary step down', function() {
 
             return collection.insertOne({ test: 1 }).catch(err => expect(err.code).to.equal(11600));
           })
-          .then(() => connectionCount(db).then(expectPoolWasCleared(initialConnectionCount)));
+          .then(() =>
+            connectionCountOnPrimary(db).then(expectPoolWasCleared(initialConnectionCount))
+          );
       });
     }
   });
